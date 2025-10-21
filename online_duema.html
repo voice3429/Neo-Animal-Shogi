@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>デュエマ将棋（オンライン統合版）</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:sans-serif;padding:18px;background:#f7f7f7}
+    h1{margin-bottom:10px}
+    .status{margin-bottom:10px;font-weight:bold}
+    #board{display:grid;grid-template-columns:repeat(3,80px);grid-template-rows:repeat(4,80px);gap:4px;margin:0 auto 12px}
+    .cell{background:#fff;border:1px solid #ccc;display:flex;align-items:center;justify-content:center;position:relative;min-height:56px;cursor:pointer}
+    .cell.highlight{background:#e0ffe0}
+    .piece{font-weight:bold;padding:4px 6px;border-radius:4px;user-select:none}
+    .player1{color:#007bff}.player2{color:#e63946}
+    .hands{display:flex;gap:12px;justify-content:center;margin-bottom:10px}
+    .hand{background:#fff;padding:8px;border-radius:6px;border:1px solid #ddd;min-width:120px}
+    #overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);align-items:center;justify-content:center;color:#fff;font-size:22px;z-index:99}
+    #roomControls{display:flex;gap:8px;align-items:center;margin-bottom:10px;justify-content:center}
+    input,button,select{padding:6px 8px}
+    #detail{min-height:48px;margin-bottom:8px}
+    .small{font-size:12px;color:#666}
+    .stack-piece-btn{display:inline-block;margin:2px;padding:2px 6px;border-radius:4px;border:1px solid #bbb;cursor:pointer;background:#fff}
+    .stack-piece-btn.selected{box-shadow:0 0 0 2px rgba(0,123,255,0.15)}
+    .msg{color:#b00020;font-weight:bold}
+  </style>
+</head>
+<body>
+  <h1>デュエマ将棋（オンライン）</h1>
+
+  <div id="roomControls">
+    <button id="createRoomBtn">ルーム作成</button>
+    <input id="roomIdInput" placeholder="ルームIDを入力 / 招待コード" />
+    <button id="joinRoomBtn">ルーム参加</button>
+    <button id="leaveRoomBtn" style="display:none">ルーム退出</button>
+  </div>
+
+  <div class="status" id="status">未接続</div>
+  <div id="roomInfo" class="small"></div>
+
+  <div id="board"></div>
+  <div id="detail"></div>
+  <div class="hands">
+    <div class="hand"><div class="small">先手の持ち駒</div><div id="hand0"></div></div>
+    <div class="hand"><div class="small">後手の持ち駒</div><div id="hand1"></div></div>
+  </div>
+
+  <div id="overlay"><div id="overlayText"></div><button id="overlayOk">OK</button></div>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/9.22.1/firebase-app.js";
+    import { getDatabase, ref, onValue, set, update, push, get, child, serverTimestamp, runTransaction, remove } from "https://www.gstatic.com/firebasejs/9.22.1/firebase-database.js";
+
+    // ====== ここをあなたの Firebase 設定に書き換えてください ======
+    const firebaseConfig = {
+      apiKey: "AIzaSyDHmXLosDq-odi2jNHzpv4EaFdUiHu6gok",
+      authDomain: "neo-animal-shogi.firebaseapp.com",
+      databaseURL: "https://neo-animal-shogi-default-rtdb.firebaseio.com",
+      projectId: "neo-animal-shogi",
+      storageBucket: "neo-animal-shogi.firebasestorage.app",
+      messagingSenderId: "809802191565",
+      appId: "1:809802191565:web:80304e233beafdcd914f84"
+    };
+    // ============================================================
+
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+
+    // UI elements
+    const boardEl = document.getElementById('board');
+    const statusEl = document.getElementById('status');
+    const handEls = [document.getElementById('hand0'), document.getElementById('hand1')];
+    const detailEl = document.getElementById('detail');
+    const overlay = document.getElementById('overlay');
+    const overlayText = document.getElementById('overlayText');
+    const overlayOk = document.getElementById('overlayOk');
+    const roomInfo = document.getElementById('roomInfo');
+    const createRoomBtn = document.getElementById('createRoomBtn');
+    const joinRoomBtn = document.getElementById('joinRoomBtn');
+    const leaveRoomBtn = document.getElementById('leaveRoomBtn');
+    const roomIdInput = document.getElementById('roomIdInput');
+
+    overlayOk.onclick = () => { overlay.style.display = 'none'; location.reload(); };
+
+    // game defs
+    const ROWS = 4, COLS = 3;
+    const pieceDefs = {
+      lion:     { name: 'ライオン',  move: [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[-1,1],[1,-1],[1,1]] },
+      giraffe:  { name: 'キリン',    move: [[-1,0],[1,0],[0,-1],[0,1]] },
+      elephant: { name: 'ゾウ',      move: [[-1,-1],[-1,1],[1,-1],[1,1]] },
+      chick:    { name: 'ヒヨコ',    move: [[-1,0]] },
+      hen:      { name: 'ニワトリ',  move: [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[-1,1]] }
+    };
+
+    // local client info
+    const localClientId = 'c_' + Math.random().toString(36).slice(2,9);
+    let localPlayerIndex = null; // 0 or 1
+    let roomId = null;
+    let roomRef = null;
+    let stateRef = null;
+    let playersRef = null;
+    let syncedState = null; // last received state from DB
+    let selected = null; // UI selection: null, {hand:true,...}, {r,c,stack}, {stackPiece:true,r,c,idx}
+    let unsubscribe = null;
+
+    // initial local view state for offline start
+    function initialState() {
+      const board = Array.from({ length: ROWS }, () => Array(COLS).fill(null));
+      board[0] = [{ type:'giraffe', player:1 }, { type:'lion', player:1 }, { type:'elephant', player:1 }];
+      board[1][1] = [{ type:'chick', player:1 }];
+      board[3] = [{ type:'elephant', player:0 }, { type:'lion', player:0 }, { type:'giraffe', player:0 }];
+      board[2][1] = [{ type:'chick', player:0 }];
+      return {
+        board,
+        hands: [[], []],
+        currentPlayer: 0,
+        lastUpdate: null
+      };
+    }
+
+    // ---------- Room controls ----------
+    createRoomBtn.onclick = async () => {
+      const id = Math.random().toString(36).slice(2,8);
+      await set(ref(db, 'rooms/' + id), {
+        state: initialState(),
+        createdAt: serverTimestamp()
+      });
+      await joinRoom(id);
+    };
+
+    joinRoomBtn.onclick = async () => {
+      const id = roomIdInput.value.trim();
+      if (!id) return alert('ルームIDを入力してください');
+      const snap = await get(ref(db, 'rooms/' + id));
+      if (!snap.exists()) return alert('そのルームは存在しません');
+      await joinRoom(id);
+    };
+
+    leaveRoomBtn.onclick = async () => {
+      if (!roomId) return;
+      // remove player entry
+      if (playersRef) {
+        try { await remove(ref(db, `rooms/${roomId}/players/${localClientId}`)); } catch(e){}
+      }
+      roomId = null;
+      localPlayerIndex = null;
+      syncedState = null;
+      selected = null;
+      if (unsubscribe) unsubscribe();
+      roomRef = stateRef = playersRef = null;
+      leaveRoomBtn.style.display = 'none';
+      statusEl.textContent = 'ルームを退出しました';
+      roomInfo.textContent = '';
+      applyStateToLocal(initialState());
+    };
+
+    async function joinRoom(id) {
+      roomId = id;
+      roomRef = ref(db, 'rooms/' + roomId);
+      stateRef = ref(db, 'rooms/' + roomId + '/state');
+      playersRef = ref(db, 'rooms/' + roomId + '/players');
+
+      // assign player index (0 or 1)
+      const playersSnap = await get(playersRef);
+      let assignedIndex = null;
+      const now = Date.now();
+      if (!playersSnap.exists()) {
+        assignedIndex = 0;
+        await update(playersRef, { [localClientId]: { index: assignedIndex, joinedAt: now } });
+      } else {
+        const players = playersSnap.val();
+        const indices = Object.values(players).map(p => p.index);
+        if (!indices.includes(0)) assignedIndex = 0;
+        else if (!indices.includes(1)) assignedIndex = 1;
+        else { alert('このルームは満員です（2人まで）'); return; }
+        await update(playersRef, { [localClientId]: { index: assignedIndex, joinedAt: now } });
+      }
+      localPlayerIndex = assignedIndex;
+      statusEl.textContent = 'ルーム参加: ' + roomId + ' | あなた: ' + (localPlayerIndex===0?'先手':'後手');
+      leaveRoomBtn.style.display = 'inline-block';
+
+      listenRoom();
+    }
+
+    // ---------- Sync ----------
+    function listenRoom() {
+      if (!stateRef) return;
+      // unsubscribe previous if any
+      // onValue returns an unsubscribe function in v9? We'll simulate removal by no-op; using onValue as listener.
+      onValue(stateRef, (snap) => {
+        if (!snap.exists()) return;
+        const s = snap.val();
+        // s: { board, hands, currentPlayer, lastUpdate }
+        syncedState = s;
+        applyStateToLocal(syncedState);
+      });
+      // update players list display
+      onValue(ref(db, 'rooms/' + roomId + '/players'), (psnap) => {
+        if (!psnap.exists()) { roomInfo.textContent = ''; return; }
+        const obj = psnap.val();
+        const list = Object.entries(obj).map(([k,v])=>'['+v.index+'] '+k).join(' / ');
+        roomInfo.textContent = 'ルーム: ' + roomId + ' | players: ' + list;
+      });
+      // also watch the room node for deletion
+      onValue(ref(db, 'rooms/' + roomId), (r) => {
+        if (!r.exists()) {
+          overlayText.textContent = 'ルームが削除されました';
+          overlay.style.display = 'flex';
+        }
+      });
+    }
+
+    function applyStateToLocal(s) {
+      if (!s) return;
+      window.board = s.board;
+      window.hands = s.hands;
+      window.currentPlayer = s.currentPlayer;
+      selected = null;
+      render();
+      statusEl.textContent = 'ルーム: ' + roomId + ' | あなた: ' + (localPlayerIndex===0?'先手':'後手') + ' | 現在の手: ' + (window.currentPlayer===0?'先手':'後手');
+    }
+
+    // ---------- Atomic write (transaction) ----------
+    // newState must include currentPlayerBeforeWrite (the expected db currentPlayer), transaction will only commit if matches
+    async function writeStateToDB(newState) {
+      if (!roomId) return alert('まずルームに参加してね');
+      if (typeof newState.currentPlayerBeforeWrite === 'undefined') {
+        alert('internal: currentPlayerBeforeWrite must be provided');
+        return;
+      }
+      const sRef = ref(db, 'rooms/' + roomId + '/state');
+      try {
+        await runTransaction(sRef, (current) => {
+          if (current === null) return current; // abort if no state
+          // if db currentPlayer mismatches expected, abort by returning undefined
+          if (current.currentPlayer !== newState.currentPlayerBeforeWrite) {
+            return; // abort transaction
+          }
+          const payload = {...newState};
+          delete payload.currentPlayerBeforeWrite;
+          payload.lastUpdate = Date.now();
+          return payload;
+        });
+      } catch (e) {
+        console.error('transaction error', e);
+        alert('書き込みに失敗しました。もう一度やり直してください。');
+      }
+    }
+
+    // ---------- Game UI + Logic (client-side validation + prepare state then write) ----------
+    // window.board / window.hands / window.currentPlayer are maintained by applyStateToLocal
+    window.board = initialState().board;
+    window.hands = [[],[]];
+    window.currentPlayer = 0;
+
+    function render() {
+      boardEl.innerHTML = '';
+      for (let r=0;r<ROWS;r++){
+        for (let c=0;c<COLS;c++){
+          const cell = document.createElement('div'); cell.className='cell'; cell.dataset.r=r; cell.dataset.c=c;
+          const stk = window.board?.[r]?.[c] ?? null;
+          if (stk) {
+            const top = stk[stk.length-1];
+            const p = document.createElement('div'); p.className='piece ' + (top.player? 'player2':'player1');
+            p.textContent = pieceName(stk);
+            cell.appendChild(p);
+            if (stk.length>1){
+              const badge = document.createElement('div'); badge.className='piece-stack'; badge.textContent = stk.length;
+              cell.appendChild(badge);
+            }
+          }
+          // highlight rules
+          if (selected) {
+            if (selected.hand) {
+              if (!stk || stk[stk.length-1].player === localPlayerIndex) cell.classList.add('highlight');
+            } else if (selected.stackPiece) {
+              if (canMoveSinglePiece(selected.r, selected.c, r, c, selected.idx)) {
+                const dest = window.board?.[r]?.[c] ?? null;
+                if (!dest || dest[dest.length-1].player === localPlayerIndex) cell.classList.add('highlight');
+              }
+            } else {
+              if ((selected.r===r && selected.c===c) || canMoveCombine(selected.r, selected.c, r, c)) cell.classList.add('highlight');
+            }
+          }
+          cell.onclick = () => onClick(r,c);
+          boardEl.appendChild(cell);
+        }
+      }
+      // hands
+      handEls.forEach((he, pl) => {
+        he.innerHTML = '';
+        (window.hands?.[pl] ?? []).forEach((type, i) => {
+          const p = document.createElement('div'); p.className='piece ' + (pl? 'player2':'player1');
+          p.textContent = pieceDefs[type].name;
+          p.onclick = (e) => { e.stopPropagation(); selectHand(pl, i); };
+          he.appendChild(p);
+        });
+      });
+      detailEl.innerHTML = '';
+      if (!selected) return;
+      if (selected.hand) {
+        detailEl.textContent = '持ち駒選択: ' + pieceDefs[selected.type].name;
+        return;
+      }
+      if (selected.stackPiece) {
+        const stk = window.board[selected.r][selected.c] || [];
+        const p = stk[selected.idx];
+        detailEl.innerHTML = '分解選択: ' + (p ? (p.player===0?'先:':'後:') + pieceDefs[p.type].name : '') + ' - 分解は1マス、敵のいるマスは不可';
+        return;
+      }
+      // stack selected -> show parts as buttons
+      const stk = window.board[selected.r][selected.c] || [];
+      detailEl.innerHTML = 'スタック中の駒（クリックで分解対象選択）: ';
+      stk.forEach((p, i) => {
+        const btn = document.createElement('span');
+        btn.className = 'stack-piece-btn' + (selected.stackPiece && selected.idx===i ? ' selected' : '');
+        btn.textContent = (p.player===0? '先:':'後:') + pieceDefs[p.type].name + ` [${i}]`;
+        btn.onclick = (e) => { e.stopPropagation(); toggleSelectStackPiece(selected.r, selected.c, i); };
+        detailEl.appendChild(btn);
+      });
+    }
+
+    function pieceName(stk){
+      const types = stk.map(p=>p.type).sort();
+      if (types.includes('lion')&&types.includes('giraffe')) return 'ジャガメ';
+      if (types.includes('lion')&&types.includes('elephant')) return 'バクテラス';
+      if (types.includes('giraffe')&&types.includes('elephant')) return 'カタスト';
+      if (types.includes('hen')) return 'ニワトリ';
+      return pieceDefs[types[types.length-1]].name;
+    }
+
+    function selectHand(pl, idx) {
+      if (pl !== localPlayerIndex) return;
+      // toggle same
+      if (selected && selected.hand && selected.idx===idx && selected.type===window.hands[pl][idx]) { selected=null; render(); return; }
+      selected = { hand:true, type: window.hands[pl][idx], idx};
+      render();
+    }
+
+    // Main click handler (client-side verify -> prepare new state -> writeStateToDB via transaction)
+    async function onClick(r,c) {
+      if (!roomId) return alert('まずルームに参加してください');
+      const dest = window.board?.[r]?.[c] ?? null;
+
+      if (selected) {
+        // 分解対象選択済み
+        if (selected.stackPiece) {
+          const { r: sr, c: sc, idx } = selected;
+          if (sr===r && sc===c) { selected=null; render(); return; }
+          if (!canMoveSinglePiece(sr, sc, r, c, idx)) { selected=null; render(); return; }
+          // 分解移動では敵のいるマスは不可
+          if (dest && dest[dest.length-1].player !== localPlayerIndex) {
+            selected = null;
+            detailEl.innerHTML = '<span class="msg">敵のいるマスには分解で移動できません</span>';
+            render();
+            return;
+          }
+          // perform move locally on a deep clone of syncedState and write via transaction
+          if (localPlayerIndex !== window.currentPlayer) return alert('あなたの番ではありません');
+          const newState = structuredClone(syncedState);
+          // ensure indices exist
+          const stk = newState.board[sr][sc];
+          if (!stk || !stk[idx]) { selected=null; render(); return; }
+          const moving = stk.splice(idx,1)[0];
+          // if source stack empty, set null
+          if (stk.length === 0) newState.board[sr][sc] = null;
+          // place at dest
+          if (!newState.board[r][c]) newState.board[r][c] = [moving];
+          else newState.board[r][c] = newState.board[r][c].concat([moving]);
+          // promote chick if reached
+          newState.board[r][c].forEach(p=>{
+            if (p.type==='chick' && p.player===localPlayerIndex && ((p.player===0 && r===0) || (p.player===1 && r===ROWS-1))) p.type='hen';
+          });
+          // switch turn
+          newState.currentPlayer = 1 - newState.currentPlayer;
+          newState.currentPlayerBeforeWrite = syncedState.currentPlayer;
+          await writeStateToDB(newState);
+          selected = null;
+          return;
+        }
+
+        // 持ち駒打ち
+        if (selected.hand) {
+          if (localPlayerIndex !== window.currentPlayer) return alert('あなたの番ではありません');
+          if (!dest || dest[dest.length-1].player === localPlayerIndex) {
+            const newState = structuredClone(syncedState);
+            newState.hands[localPlayerIndex].splice(selected.idx,1);
+            newState.board[r][c] = dest ? dest.concat([{ type: selected.type, player: localPlayerIndex }]) : [{ type: selected.type, player: localPlayerIndex }];
+            // promote if applicable
+            newState.board[r][c].forEach(p=>{
+              if (p.type==='chick' && p.player===localPlayerIndex && ((p.player===0 && r===0) || (p.player===1 && r===ROWS-1))) p.type='hen';
+            });
+            newState.currentPlayer = 1 - newState.currentPlayer;
+            newState.currentPlayerBeforeWrite = syncedState.currentPlayer;
+            await writeStateToDB(newState);
+            selected = null;
+          } else {
+            selected = null; render();
+          }
+          return;
+        }
+
+        // スタックを選んでいる状態 → 通常の合体/移動（分解ではない）
+        const { r: sr, c: sc, stack: sst } = selected;
+        if (sr===r && sc===c) { selected=null; render(); return; }
+        if (!canMoveCombine(sr, sc, r, c)) { selected=null; render(); return; }
+        if (localPlayerIndex !== window.currentPlayer) return alert('あなたの番ではありません');
+
+        const newState = structuredClone(syncedState);
+        const destStack = newState.board[r][c];
+        // enemy capture
+        if (destStack && destStack[destStack.length-1].player !== localPlayerIndex) {
+          // capture -> add to hands (hen -> chick)
+          destStack.forEach(p=>newState.hands[localPlayerIndex].push(p.type==='hen'?'chick':p.type));
+          const capturedHasLion = destStack.some(p=>p.type==='lion');
+          newState.board[r][c] = newState.board[sr][sc];
+          newState.board[sr][sc] = null;
+          // promote chicks
+          newState.board[r][c].forEach(p=>{
+            if (p.type==='chick' && p.player===localPlayerIndex && ((p.player===0 && r===0) || (p.player===1 && r===ROWS-1))) p.type='hen';
+          });
+          newState.currentPlayer = 1 - newState.currentPlayer;
+          newState.currentPlayerBeforeWrite = syncedState.currentPlayer;
+          await writeStateToDB(newState);
+          selected = null;
+          if (capturedHasLion) {
+            overlayText.textContent = (localPlayerIndex===0?'先手':'後手') + ' の勝利！';
+            overlay.style.display = 'flex';
+          }
+          return;
+        } else {
+          // move to empty or own stack
+          newState.board[r][c] = destStack ? destStack.concat(newState.board[sr][sc]) : newState.board[sr][sc];
+          newState.board[sr][sc] = null;
+          newState.board[r][c].forEach(p=>{
+            if (p.type==='chick' && p.player===localPlayerIndex && ((p.player===0 && r===0) || (p.player===1 && r===ROWS-1))) p.type='hen';
+          });
+          newState.currentPlayer = 1 - newState.currentPlayer;
+          newState.currentPlayerBeforeWrite = syncedState.currentPlayer;
+          await writeStateToDB(newState);
+          selected = null;
+          return;
+        }
+      } else {
+        // 選択していない状態 -> 自分のスタックを選択できる
+        if (dest && dest[dest.length-1].player === localPlayerIndex) {
+          selected = { r,c, stack: window.board[r][c] };
+          render();
+        }
+      }
+    } // end onClick
+
+    // 分解用：単一駒の1マス移動可否
+    function canMoveSinglePiece(sr, sc, tr, tc, idx) {
+      const dy = tr - sr;
+      const dx = tc - sc;
+      const stk = window.board?.[sr]?.[sc]; if (!stk || !stk[idx]) return false;
+      const p = stk[idx];
+      if (!(dx === 0 || dy === 0 || Math.abs(dx) === Math.abs(dy))) return false;
+      const actualSteps = Math.max(Math.abs(dy), Math.abs(dx));
+      if (actualSteps !== 1) return false;
+      let ok = false;
+      pieceDefs[p.type].move.forEach(([mdy, mdx]) => {
+        let ndy = mdy, ndx = mdx;
+        if (p.type === 'chick' || p.type === 'hen') ndy *= (p.player === 0 ? 1 : -1);
+        if (ndy === dy && ndx === dx) ok = true;
+      });
+      if (!ok) return false;
+      if (!window.board[tr] || typeof window.board[tr][tc] === 'undefined') return false;
+      return true;
+    }
+
+    // 合体移動ルール（既存）
+    function canMoveCombine(sr, sc, tr, tc) {
+      const dy = tr - sr;
+      const dx = tc - sc;
+      if (!(dx === 0 || dy === 0 || Math.abs(dx) === Math.abs(dy))) return false;
+      const stk = window.board?.[sr]?.[sc]; if (!stk) return false;
+      const support = {};
+      stk.forEach(p => {
+        pieceDefs[p.type].move.forEach(([dy0, dx0]) => {
+          let ndy = dy0, ndx = dx0;
+          if (p.type === 'chick' || p.type === 'hen') ndy *= (p.player === 0 ? 1 : -1);
+          const key = ndy + ',' + ndx;
+          support[key] = (support[key] || 0) + 1;
+        });
+      });
+      const normDy = dy ? dy / Math.abs(dy) : 0;
+      const normDx = dx ? dx / Math.abs(dx) : 0;
+      const key = normDy + ',' + normDx;
+      const maxSteps = support[key] || 0;
+      const actualSteps = Math.max(Math.abs(dy), Math.abs(dx));
+      if (actualSteps >= 1 && actualSteps <= maxSteps) {
+        for (let i = 1; i < actualSteps; i++) {
+          const nr = sr + normDy * i, nc = sc + normDx * i;
+          if (!window.board[nr] || window.board[nr][nc]) return false;
+        }
+        return true;
+      }
+      return false;
+    }
+
+    // 分解対象トグル
+    function toggleSelectStackPiece(r, c, idx) {
+      if (selected && selected.stackPiece && selected.r===r && selected.c===c && selected.idx===idx) {
+        selected = null; detailEl.innerHTML = ''; render(); return;
+      }
+      selected = { stackPiece:true, r, c, idx };
+      render();
+    }
+
+    // document 外クリックで選択をキャンセル（持ち駒・盤上・分解対象のいずれも）
+    document.addEventListener('click', (e) => {
+      if (e.target.closest('.piece') || e.target.closest('.cell') || e.target.closest('.stack-piece-btn') || e.target === roomIdInput || e.target === createRoomBtn || e.target === joinRoomBtn || e.target === leaveRoomBtn) return;
+      if (selected) { selected = null; render(); }
+    });
+
+    // leave room on unload
+    window.addEventListener('beforeunload', async () => {
+      if (!roomId) return;
+      try { await remove(ref(db, `rooms/${roomId}/players/${localClientId}`)); } catch(e){}
+    });
+
+    // init local view
+    applyStateToLocal(initialState());
+  </script>
+</body>
+</html>
